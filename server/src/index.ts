@@ -2,7 +2,7 @@ import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import http from "node:http";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, type WebSocket } from "ws";
 import { ClipStore, type ClipState } from "./storage.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
