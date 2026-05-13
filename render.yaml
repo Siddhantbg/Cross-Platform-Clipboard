@@ -2,14 +2,13 @@ services:
   - type: web
     name: cross-clipboard-server
     env: node
-    rootDir: server
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: npm run start
+    buildCommand: cd server && npm install && npm run build
+    startCommand: cd server && npm run start
     envVars:
       - key: CLIPBOARD_PASSWORD
         sync: false
       - key: CORS_ORIGIN
         sync: false
       - key: CLIPBOARD_STORE_PATH
-        value: /opt/render/project/src/data/clipboard.json
+        value: /opt/render/project/server/data/clipboard.json
