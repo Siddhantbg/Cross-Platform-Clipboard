@@ -3,11 +3,13 @@ import QRCode from "qrcode";
 
 type ClipState = {
   text: string;
+  image: string | null;
   updatedAt: string | null;
 };
 
 type HistoryEntry = {
   text: string;
+  image: string | null;
   updatedAt: string;
 };
 
@@ -16,6 +18,7 @@ type SocketMessage =
   | { type: "update"; payload: ClipState };
 
 const MAX_LEN = 50000;
+const MAX_IMAGE_LEN = 4_000_000;
 const STORAGE_KEY = "cross-clipboard:last";
 const HISTORY_LIMIT = 8;
 const PASSWORD_KEY = "cross-clipboard:password";
@@ -46,17 +49,127 @@ function makeWsUrl(base: string, secret: string, password: string): string {
   }
 }
 
+function normalizeClipState(value: Partial<ClipState> | null | undefined): ClipState {
+  return {
+    text: typeof value?.text === "string" ? value.text : "",
+    image: typeof value?.image === "string" ? value.image : null,
+    updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : null
+  };
+}
+
+function normalizeHistoryEntry(value: Partial<HistoryEntry>): HistoryEntry {
+  return {
+    text: typeof value.text === "string" ? value.text : "",
+    image: typeof value.image === "string" ? value.image : null,
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : new Date(0).toISOString()
+  };
+}
+
+function cachePayload(state: ClipState, history: HistoryEntry[]) {
+  return {
+    state: {
+      text: state.text,
+      image: null,
+      updatedAt: state.updatedAt
+    },
+    history: history.map((entry) => ({
+      text: entry.text,
+      image: null,
+      updatedAt: entry.updatedAt
+    }))
+  };
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("Failed to read image"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function readImageFromDataTransfer(data: DataTransfer | null): Promise<string | null> {
+  if (!data) {
+    return null;
+  }
+
+  for (const item of Array.from(data.items)) {
+    if (item.kind === "file" && item.type.startsWith("image/")) {
+      const file = item.getAsFile();
+      if (file) {
+        return blobToDataUrl(file);
+      }
+    }
+  }
+
+  for (const file of Array.from(data.files)) {
+    if (file.type.startsWith("image/")) {
+      return blobToDataUrl(file);
+    }
+  }
+
+  return null;
+}
+
+async function readClipboardContent(): Promise<{ text?: string; image?: string }> {
+  if (navigator.clipboard.read) {
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        for (const type of item.types) {
+          if (type.startsWith("image/")) {
+            const blob = await item.getType(type);
+            return { image: await blobToDataUrl(blob) };
+          }
+        }
+      }
+      for (const item of items) {
+        if (item.types.includes("text/plain")) {
+          const blob = await item.getType("text/plain");
+          return { text: await blob.text() };
+        }
+      }
+    } catch {
+      // fall through to readText
+    }
+  }
+
+  try {
+    return { text: await navigator.clipboard.readText() };
+  } catch {
+    return {};
+  }
+}
+
+function hasPasteContent(content: { text?: string; image?: string }): boolean {
+  return Boolean(content.image || content.text !== undefined);
+}
+
+async function writeClipToClipboard(entry: Pick<ClipState, "text" | "image">): Promise<void> {
+  if (entry.image) {
+    const response = await fetch(entry.image);
+    const blob = await response.blob();
+    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    return;
+  }
+  await navigator.clipboard.writeText(entry.text || "");
+}
+
 export default function App() {
   const [secret] = useState<string>(getOrCreateSecret);
-  const [state, setState] = useState<ClipState>({ text: "", updatedAt: null });
+  const [state, setState] = useState<ClipState>({ text: "", image: null, updatedAt: null });
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [input, setInput] = useState("");
+  const [pendingImage, setPendingImage] = useState<string | null>(null);
   const [password, setPassword] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
   const [status, setStatus] = useState("Idle");
   const [connected, setConnected] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const clipBufferRef = useRef<Pick<ClipState, "text" | "image"> | null>(null);
 
   const apiBase = import.meta.env.VITE_API_BASE
     ? import.meta.env.VITE_API_BASE.replace(/\/$/, "")
@@ -79,10 +192,10 @@ export default function App() {
       try {
         const parsed = JSON.parse(stored) as { state: ClipState; history?: HistoryEntry[] };
         if (parsed.state) {
-          setState(parsed.state);
+          setState(normalizeClipState(parsed.state));
         }
         if (parsed.history) {
-          setHistory(parsed.history);
+          setHistory(parsed.history.map(normalizeHistoryEntry).slice(0, HISTORY_LIMIT));
         }
       } catch {
         // ignore invalid cache
@@ -103,17 +216,14 @@ export default function App() {
           throw new Error("Failed to load");
         }
         const data = (await res.json()) as ClipState & { history?: HistoryEntry[] };
-        setState({ text: data.text, updatedAt: data.updatedAt });
-        if (data.history) {
-          setHistory(data.history.slice(0, HISTORY_LIMIT));
-        }
-        localStorage.setItem(
-          STORAGE_KEY,
-          JSON.stringify({ state: { text: data.text, updatedAt: data.updatedAt }, history: data.history })
-        );
+        const nextState = normalizeClipState(data);
+        const nextHistory = (data.history ?? []).map(normalizeHistoryEntry).slice(0, HISTORY_LIMIT);
+        setState(nextState);
+        setHistory(nextHistory);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload(nextState, nextHistory)));
         setStatus("Loaded");
       } catch {
-        setStatus("Offline (showing cached text)");
+        setStatus("Offline (showing cached clip)");
       }
     };
     load();
@@ -143,21 +253,20 @@ export default function App() {
       try {
         const msg = JSON.parse(event.data) as SocketMessage;
         if (msg.type === "state" || msg.type === "update") {
-          setState(msg.payload);
+          const payload = normalizeClipState(msg.payload);
+          setState(payload);
           setHistory((prev) => {
-            if (!msg.payload.updatedAt) {
+            if (!payload.updatedAt) {
               return prev;
             }
-            const nextEntry: HistoryEntry = {
-              text: msg.payload.text,
-              updatedAt: msg.payload.updatedAt
-            };
+            const nextEntry = normalizeHistoryEntry({
+              text: payload.text,
+              image: payload.image,
+              updatedAt: payload.updatedAt
+            });
             const deduped = prev.filter((entry) => entry.updatedAt !== nextEntry.updatedAt);
             const next = [nextEntry, ...deduped].slice(0, HISTORY_LIMIT);
-            localStorage.setItem(
-              STORAGE_KEY,
-              JSON.stringify({ state: msg.payload, history: next })
-            );
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload(payload, next)));
             return next;
           });
         }
@@ -171,10 +280,22 @@ export default function App() {
     };
   }, [apiBase, secret, password]);
 
+  const applyClipToSend = (entry: Pick<ClipState, "text" | "image">) => {
+    clipBufferRef.current = { text: entry.text, image: entry.image };
+    if (entry.image) {
+      setPendingImage(entry.image);
+      setInput("");
+      return;
+    }
+    setPendingImage(null);
+    setInput(entry.text);
+  };
+
   const handleCopy = async () => {
+    clipBufferRef.current = { text: state.text, image: state.image };
     try {
-      await navigator.clipboard.writeText(state.text || "");
-      setStatus("Copied to clipboard");
+      await writeClipToClipboard(state);
+      setStatus(state.image ? "Image copied" : "Copied to clipboard");
     } catch {
       setStatus("Copy failed");
     }
@@ -182,24 +303,91 @@ export default function App() {
 
   const handlePaste = async () => {
     try {
-      const text = await navigator.clipboard.readText();
-      setInput(text);
-      setStatus("Pasted from clipboard");
+      const content = await readClipboardContent();
+      if (hasPasteContent(content)) {
+        applyClipToSend({
+          text: content.text ?? "",
+          image: content.image ?? null
+        });
+        setStatus(content.image ? "Image pasted" : "Pasted from clipboard");
+        return;
+      }
+      if (clipBufferRef.current) {
+        applyClipToSend(clipBufferRef.current);
+        setStatus("Pasted from last copy");
+        return;
+      }
+      setStatus("Paste failed — copy something first");
     } catch {
+      if (clipBufferRef.current) {
+        applyClipToSend(clipBufferRef.current);
+        setStatus("Pasted from last copy");
+        return;
+      }
       setStatus("Paste failed");
+    }
+  };
+
+  const handleSendAreaPaste = async (event: React.ClipboardEvent) => {
+    try {
+      const image = await readImageFromDataTransfer(event.clipboardData);
+      if (!image) {
+        return;
+      }
+      event.preventDefault();
+      applyClipToSend({ text: "", image });
+      setStatus("Image pasted");
+    } catch {
+      setStatus("Image paste failed");
+    }
+  };
+
+  const handleSendAreaDrop = async (event: React.DragEvent) => {
+    event.preventDefault();
+    try {
+      const image = await readImageFromDataTransfer(event.dataTransfer);
+      if (!image) {
+        return;
+      }
+      applyClipToSend({ text: "", image });
+      setStatus("Image added");
+    } catch {
+      setStatus("Image drop failed");
+    }
+  };
+
+  const handleFilePick = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !file.type.startsWith("image/")) {
+      setStatus("Pick an image file");
+      return;
+    }
+    try {
+      setPendingImage(await blobToDataUrl(file));
+      setInput("");
+      setStatus("Image selected");
+    } catch {
+      setStatus("Image read failed");
     }
   };
 
   const handleSend = async () => {
     const trimmed = input.trimEnd();
-    if (!trimmed) {
+    if (!pendingImage && !trimmed) {
       setStatus("Nothing to send");
       return;
     }
-    if (trimmed.length > MAX_LEN) {
+    if (pendingImage) {
+      if (pendingImage.length > MAX_IMAGE_LEN) {
+        setStatus("Image too large");
+        return;
+      }
+    } else if (trimmed.length > MAX_LEN) {
       setStatus("Text too long");
       return;
     }
+
     try {
       const res = await fetch(`${apiBase}/api/clip/${secret}`, {
         method: "POST",
@@ -207,12 +395,15 @@ export default function App() {
           "Content-Type": "application/json",
           "X-Clipboard-Password": password
         },
-        body: JSON.stringify({ text: trimmed })
+        body: JSON.stringify(
+          pendingImage ? { text: "", image: pendingImage } : { text: trimmed, image: null }
+        )
       });
       if (!res.ok) {
         throw new Error("Send failed");
       }
       setInput("");
+      setPendingImage(null);
       setStatus("Sent");
     } catch {
       setStatus("Send failed");
@@ -228,10 +419,16 @@ export default function App() {
     }
   };
 
-  const handleHistoryCopy = async (text: string) => {
+  const handleHistoryUse = (entry: HistoryEntry) => {
+    applyClipToSend(entry);
+    setStatus(entry.image ? "History image loaded" : "History loaded");
+  };
+
+  const handleHistoryCopy = async (entry: HistoryEntry) => {
+    clipBufferRef.current = { text: entry.text, image: entry.image };
     try {
-      await navigator.clipboard.writeText(text);
-      setStatus("History copied");
+      await writeClipToClipboard(entry);
+      setStatus(entry.image ? "History image copied" : "History copied");
     } catch {
       setStatus("History copy failed");
     }
@@ -251,12 +448,11 @@ export default function App() {
         throw new Error("Delete failed");
       }
       const data = (await res.json()) as ClipState & { history?: HistoryEntry[] };
-      setState({ text: data.text, updatedAt: data.updatedAt });
-      setHistory((data.history ?? []).slice(0, HISTORY_LIMIT));
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({ state: { text: data.text, updatedAt: data.updatedAt }, history: data.history })
-      );
+      const nextState = normalizeClipState(data);
+      const nextHistory = (data.history ?? []).map(normalizeHistoryEntry).slice(0, HISTORY_LIMIT);
+      setState(nextState);
+      setHistory(nextHistory);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload(nextState, nextHistory)));
       setStatus("History deleted");
     } catch {
       setStatus("Delete failed");
@@ -280,6 +476,8 @@ export default function App() {
     ? new Date(state.updatedAt).toLocaleTimeString()
     : "Never";
 
+  const hasLatestClip = Boolean(state.text || state.image);
+
   const handleUnlock = () => {
     if (!passwordInput.trim()) {
       setStatus("Enter the password");
@@ -300,8 +498,9 @@ export default function App() {
     setPasswordInput("");
     setConnected(false);
     setInput("");
+    setPendingImage(null);
     setHistory([]);
-    setState({ text: "", updatedAt: null });
+    setState({ text: "", image: null, updatedAt: null });
     setStatus("Locked");
   };
 
@@ -363,16 +562,24 @@ export default function App() {
 
         <section className="panel">
           <div className="panel-header">
-            <h2>Latest text</h2>
-            <button className="btn ghost" onClick={handleCopy}>
+            <h2>Latest clip</h2>
+            <button className="btn ghost" onClick={handleCopy} disabled={!hasLatestClip}>
               Copy
             </button>
           </div>
-          <div className="text-box">
-            {state.text ? state.text : "Nothing yet. Paste something on your laptop."}
-          </div>
+          {state.image ? (
+            <div className="image-box">
+              <img className="clip-image" src={state.image} alt="Latest clipboard image" />
+            </div>
+          ) : (
+            <div className="text-box">
+              {state.text ? state.text : "Nothing yet. Paste text or an image on your laptop."}
+            </div>
+          )}
           <div className="meta">
             <span>Last update: {formattedTime}</span>
+            <span className="dot">•</span>
+            <span>Type: {state.image ? "Image" : "Text"}</span>
             <span className="dot">•</span>
             <span>Status: {status}</span>
           </div>
@@ -380,23 +587,51 @@ export default function App() {
 
         <section className="panel">
           <div className="panel-header">
-            <h2>Send new text</h2>
+            <h2>Send new clip</h2>
             <div className="row">
               <button className="btn ghost" onClick={handlePaste}>
                 Paste
+              </button>
+              <button className="btn ghost" onClick={() => fileInputRef.current?.click()}>
+                Pick image
               </button>
               <button className="btn" onClick={handleSend}>
                 Send
               </button>
             </div>
           </div>
-          <textarea
-            className="input"
-            placeholder="Type or paste text to send..."
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            rows={5}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            hidden
+            onChange={handleFilePick}
           />
+          <div
+            className="send-area"
+            tabIndex={0}
+            onPaste={handleSendAreaPaste}
+            onDrop={handleSendAreaDrop}
+            onDragOver={(event) => event.preventDefault()}
+          >
+            {pendingImage ? (
+              <div className="image-preview">
+                <img className="clip-image" src={pendingImage} alt="Image ready to send" />
+                <button className="btn ghost image-clear" type="button" onClick={() => setPendingImage(null)}>
+                  Remove image
+                </button>
+              </div>
+            ) : (
+              <textarea
+                className="input"
+                placeholder="Type or paste text or an image here (Ctrl+V)..."
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                rows={5}
+              />
+            )}
+          </div>
+          <p className="muted send-hint">Tip: focus this box, pick an image from Win+V, then press Ctrl+V.</p>
         </section>
 
         <section className="panel share">
@@ -428,27 +663,41 @@ export default function App() {
               <div className="history-empty">No history yet.</div>
             ) : (
               history.map((entry) => (
-                <button
-                  key={entry.updatedAt}
-                  className="history-item"
-                  onClick={() => handleHistoryCopy(entry.text)}
-                >
-                  <div className="history-row">
-                    <div className="history-text">{entry.text}</div>
+                <div key={entry.updatedAt} className="history-item">
+                  <button
+                    className="history-body"
+                    type="button"
+                    onClick={() => handleHistoryUse(entry)}
+                  >
+                    <div className="history-row">
+                      {entry.image ? (
+                        <img className="history-thumb" src={entry.image} alt="History image" />
+                      ) : (
+                        <div className="history-text">{entry.text}</div>
+                      )}
+                    </div>
+                    <div className="history-meta">
+                      {new Date(entry.updatedAt).toLocaleTimeString()} • {entry.image ? "Image" : "Text"}
+                    </div>
+                  </button>
+                  <div className="history-actions">
+                    <button
+                      className="history-action"
+                      type="button"
+                      onClick={() => handleHistoryCopy(entry)}
+                    >
+                      Copy
+                    </button>
                     <button
                       className="history-delete"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        handleHistoryDelete(entry.updatedAt);
-                      }}
+                      onClick={() => handleHistoryDelete(entry.updatedAt)}
                       aria-label="Delete history item"
                       type="button"
                     >
                       Delete
                     </button>
                   </div>
-                  <div className="history-meta">{new Date(entry.updatedAt).toLocaleTimeString()}</div>
-                </button>
+                </div>
               ))
             )}
           </div>

@@ -3,6 +3,7 @@ import path from "node:path";
 
 export type ClipState = {
   text: string;
+  image: string | null;
   updatedAt: string;
 };
 
@@ -14,6 +15,21 @@ export type ClipEntry = {
 type StoreData = Record<string, ClipEntry | ClipState>;
 
 const MAX_HISTORY = 20;
+
+function normalizeState(state: Partial<ClipState> & { updatedAt: string }): ClipState {
+  return {
+    text: typeof state.text === "string" ? state.text : "",
+    image: typeof state.image === "string" ? state.image : null,
+    updatedAt: state.updatedAt
+  };
+}
+
+function normalizeEntry(entry: ClipEntry): ClipEntry {
+  return {
+    current: normalizeState(entry.current),
+    history: entry.history.map((item) => normalizeState(item))
+  };
+}
 
 export class ClipStore {
   private data = new Map<string, ClipEntry>();
@@ -34,10 +50,10 @@ export class ClipStore {
       const parsed = JSON.parse(raw) as StoreData;
       for (const [key, value] of Object.entries(parsed)) {
         if ("current" in value && "history" in value) {
-          this.data.set(key, value as ClipEntry);
+          this.data.set(key, normalizeEntry(value as ClipEntry));
         } else {
-          const legacy = value as ClipState;
-          this.data.set(key, { current: legacy, history: legacy.text ? [legacy] : [] });
+          const legacy = normalizeState(value as ClipState);
+          this.data.set(key, { current: legacy, history: legacy.text || legacy.image ? [legacy] : [] });
         }
       }
     } catch {
@@ -46,16 +62,22 @@ export class ClipStore {
   }
 
   getEntry(secret: string): ClipEntry {
-    return (
-      this.data.get(secret) ?? {
-        current: { text: "", updatedAt: new Date(0).toISOString() },
-        history: []
-      }
-    );
+    const entry = this.data.get(secret);
+    if (entry) {
+      return entry;
+    }
+    return {
+      current: { text: "", image: null, updatedAt: new Date(0).toISOString() },
+      history: []
+    };
   }
 
-  set(secret: string, text: string): ClipState {
-    const next = { text, updatedAt: new Date().toISOString() };
+  set(secret: string, content: { text: string; image?: string | null }): ClipState {
+    const next: ClipState = {
+      text: content.text,
+      image: content.image ?? null,
+      updatedAt: new Date().toISOString()
+    };
     const existing = this.getEntry(secret);
     const history = [next, ...existing.history].slice(0, MAX_HISTORY);
     this.data.set(secret, { current: next, history });
@@ -71,7 +93,7 @@ export class ClipStore {
   deleteHistoryEntry(secret: string, updatedAt: string): ClipEntry {
     const entry = this.getEntry(secret);
     const history = entry.history.filter((item) => item.updatedAt !== updatedAt);
-    const nextCurrent = history[0] ?? { text: "", updatedAt: new Date(0).toISOString() };
+    const nextCurrent = history[0] ?? { text: "", image: null, updatedAt: new Date(0).toISOString() };
     const nextEntry = { current: nextCurrent, history };
     this.data.set(secret, nextEntry);
     this.scheduleWrite();

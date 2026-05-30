@@ -9,6 +9,7 @@ const PORT = Number(process.env.PORT ?? 8787);
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "*";
 const STORE_PATH = process.env.CLIPBOARD_STORE_PATH;
 const MAX_LEN = 50000;
+const MAX_IMAGE_LEN = 4_000_000;
 const HISTORY_DEFAULT = 8;
 const PASSWORD = process.env.CLIPBOARD_PASSWORD;
 if (!PASSWORD) {
@@ -16,7 +17,7 @@ if (!PASSWORD) {
 }
 
 const app = express();
-app.use(express.json({ limit: "100kb" }));
+app.use(express.json({ limit: "5mb" }));
 app.use(
   cors({
     origin: CORS_ORIGIN,
@@ -70,10 +71,15 @@ app.get("/api/clip/:secret", (req, res) => {
   const history = store.getHistory(secret, Number.isFinite(limit) ? limit : HISTORY_DEFAULT);
   res.json({
     text: state.text,
+    image: state.image,
     updatedAt: state.updatedAt === new Date(0).toISOString() ? null : state.updatedAt,
     history
   });
 });
+
+function isValidImageDataUrl(value: string): boolean {
+  return /^data:image\/(?:png|jpe?g|gif|webp|bmp|svg\+xml);base64,/i.test(value);
+}
 
 app.post("/api/clip/:secret", (req, res) => {
   const provided = req.header("x-clipboard-password") ?? "";
@@ -82,17 +88,27 @@ app.post("/api/clip/:secret", (req, res) => {
   }
   const secret = req.params.secret;
   const text = typeof req.body?.text === "string" ? req.body.text : "";
-  if (!text) {
-    return res.status(400).json({ error: "Text required" });
+  const image = typeof req.body?.image === "string" && req.body.image ? req.body.image : null;
+  if (!text && !image) {
+    return res.status(400).json({ error: "Text or image required" });
   }
   if (text.length > MAX_LEN) {
     return res.status(413).json({ error: "Text too long" });
   }
-  const state = store.set(secret, text);
+  if (image) {
+    if (image.length > MAX_IMAGE_LEN) {
+      return res.status(413).json({ error: "Image too large" });
+    }
+    if (!isValidImageDataUrl(image)) {
+      return res.status(400).json({ error: "Invalid image format" });
+    }
+  }
+  const state = store.set(secret, { text, image });
   const history = store.getHistory(secret, HISTORY_DEFAULT);
   broadcast(secret, state);
   res.json({
     text: state.text,
+    image: state.image,
     updatedAt: state.updatedAt,
     history
   });
@@ -112,6 +128,7 @@ app.delete("/api/clip/:secret/history", (req, res) => {
   const history = entry.history.slice(0, HISTORY_DEFAULT);
   res.json({
     text: entry.current.text,
+    image: entry.current.image,
     updatedAt: entry.current.updatedAt === new Date(0).toISOString() ? null : entry.current.updatedAt,
     history
   });
