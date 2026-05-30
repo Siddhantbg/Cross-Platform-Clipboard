@@ -45,6 +45,8 @@ body {
 
 .card {
   width: min(960px, 100%);
+  max-width: 100%;
+  min-width: 0;
   background: var(--glass);
   border: 1px solid var(--stroke);
   border-radius: 28px;
@@ -95,6 +97,7 @@ h2 {
   border: 1px solid rgba(47, 107, 255, 0.12);
   display: grid;
   gap: 16px;
+  min-width: 0;
 }
 
 .panel-header {
@@ -114,6 +117,9 @@ h2 {
   font-size: 16px;
   line-height: 1.5;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 100%;
 }
 
 .meta {
@@ -131,6 +137,8 @@ h2 {
 
 .input {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border-radius: 16px;
   padding: 14px 16px;
   border: 1px solid rgba(47, 107, 255, 0.2);
@@ -139,6 +147,8 @@ h2 {
   min-height: 120px;
   font-family: inherit;
   background: rgba(255, 255, 255, 0.9);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .btn {
@@ -253,6 +263,9 @@ h2 {
   white-space: pre-wrap;
   max-height: 4.2em;
   overflow: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
 }
 
 .history-delete {
@@ -280,11 +293,15 @@ h2 {
 
 .share-input {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border-radius: 14px;
   border: 1px solid rgba(47, 107, 255, 0.2);
   padding: 10px 12px;
   background: rgba(255, 255, 255, 0.9);
   font-family: inherit;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .muted {
