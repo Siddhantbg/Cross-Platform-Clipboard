@@ -43,12 +43,16 @@ function getRoom(secret: string) {
   return next;
 }
 
-function broadcast(secret: string, state: ClipState) {
+function broadcast(secret: string, state: ClipState, history?: ClipState[]) {
   const room = rooms.get(secret);
   if (!room) {
     return;
   }
-  const payload = JSON.stringify({ type: "update", payload: state });
+  const payload = JSON.stringify({
+    type: "update",
+    payload: state,
+    history: (history ?? store.getHistory(secret, HISTORY_DEFAULT)).slice(0, HISTORY_DEFAULT)
+  });
   for (const ws of room) {
     if (ws.readyState === ws.OPEN) {
       ws.send(payload);
@@ -105,7 +109,7 @@ app.post("/api/clip/:secret", (req, res) => {
   }
   const state = store.set(secret, { text, image });
   const history = store.getHistory(secret, HISTORY_DEFAULT);
-  broadcast(secret, state);
+  broadcast(secret, state, history);
   res.json({
     text: state.text,
     image: state.image,
@@ -126,6 +130,7 @@ app.delete("/api/clip/:secret/history", (req, res) => {
   }
   const entry = store.deleteHistoryEntry(secret, updatedAt);
   const history = entry.history.slice(0, HISTORY_DEFAULT);
+  broadcast(secret, entry.current, history);
   res.json({
     text: entry.current.text,
     image: entry.current.image,
@@ -151,7 +156,8 @@ wss.on("connection", (ws, req) => {
   room.add(ws);
 
   const state = store.getEntry(secret).current;
-  ws.send(JSON.stringify({ type: "state", payload: state }));
+  const history = store.getHistory(secret, HISTORY_DEFAULT);
+  ws.send(JSON.stringify({ type: "state", payload: state, history }));
 
   ws.on("close", () => {
     room.delete(ws);

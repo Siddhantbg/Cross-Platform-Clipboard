@@ -22,7 +22,7 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      registerType: "autoUpdate",
+      registerType: "prompt",
       includeAssets: ["icons/icon-192.svg", "icons/icon-512.svg"],
       manifest: {
         name: "Cross Clipboard",
@@ -48,7 +48,9 @@ export default defineConfig({
         ]
       },
       workbox: {
-        navigateFallbackDenylist: [/^\/api\//, /^\/clip-ws/]
+        navigateFallbackDenylist: [/^\/api\//, /^\/clip-ws/],
+        skipWaiting: false,
+        clientsClaim: false
       }
     })
   ]

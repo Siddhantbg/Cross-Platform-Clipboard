@@ -14,8 +14,8 @@ type HistoryEntry = {
 };
 
 type SocketMessage =
-  | { type: "state"; payload: ClipState }
-  | { type: "update"; payload: ClipState };
+  | { type: "state"; payload: ClipState; history?: HistoryEntry[] }
+  | { type: "update"; payload: ClipState; history?: HistoryEntry[] };
 
 const MAX_LEN = 50000;
 const MAX_IMAGE_LEN = 4_000_000;
@@ -146,14 +146,104 @@ function hasPasteContent(content: { text?: string; image?: string }): boolean {
   return Boolean(content.image || content.text !== undefined);
 }
 
+function dataUrlToBlob(dataUrl: string): Blob {
+  const [header, base64 = ""] = dataUrl.split(",");
+  const mime = header.match(/:(.*?);/)?.[1] ?? "image/png";
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mime });
+}
+
+async function blobToPng(blob: Blob): Promise<Blob> {
+  if (blob.type === "image/png") {
+    return blob;
+  }
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Canvas unavailable");
+  }
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const png = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!png) {
+    throw new Error("PNG conversion failed");
+  }
+  return png;
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // fall through to legacy copy
+    }
+  }
+
+  const el = document.createElement("textarea");
+  el.value = text;
+  el.setAttribute("readonly", "");
+  el.style.position = "fixed";
+  el.style.left = "-9999px";
+  document.body.appendChild(el);
+  el.select();
+  const ok = document.execCommand("copy");
+  document.body.removeChild(el);
+  if (!ok) {
+    throw new Error("Copy failed");
+  }
+}
+
+async function copyImageToClipboard(dataUrl: string): Promise<void> {
+  const blob = dataUrlToBlob(dataUrl);
+  const pngBlob = await blobToPng(blob);
+
+  if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": pngBlob })]);
+      return;
+    } catch {
+      // fall through
+    }
+  }
+
+  throw new Error("Image copy not supported in this browser");
+}
+
 async function writeClipToClipboard(entry: Pick<ClipState, "text" | "image">): Promise<void> {
   if (entry.image) {
-    const response = await fetch(entry.image);
-    const blob = await response.blob();
-    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    await copyImageToClipboard(entry.image);
     return;
   }
-  await navigator.clipboard.writeText(entry.text || "");
+  await copyTextToClipboard(entry.text || "");
+}
+
+function applyServerPayload(
+  payload: ClipState,
+  historyFromServer: HistoryEntry[] | undefined,
+  prevHistory: HistoryEntry[]
+): HistoryEntry[] {
+  if (historyFromServer) {
+    return historyFromServer.map(normalizeHistoryEntry).slice(0, HISTORY_LIMIT);
+  }
+  if (!payload.updatedAt) {
+    return prevHistory;
+  }
+  const nextEntry = normalizeHistoryEntry({
+    text: payload.text,
+    image: payload.image,
+    updatedAt: payload.updatedAt
+  });
+  const deduped = prevHistory.filter((entry) => entry.updatedAt !== nextEntry.updatedAt);
+  return [nextEntry, ...deduped].slice(0, HISTORY_LIMIT);
 }
 
 export default function App() {
@@ -162,8 +252,8 @@ export default function App() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [input, setInput] = useState("");
   const [pendingImage, setPendingImage] = useState<string | null>(null);
-  const [password, setPassword] = useState("");
-  const [passwordInput, setPasswordInput] = useState("");
+  const [password, setPassword] = useState(() => sessionStorage.getItem(PASSWORD_KEY) ?? "");
+  const [passwordInput, setPasswordInput] = useState(() => sessionStorage.getItem(PASSWORD_KEY) ?? "");
   const [status, setStatus] = useState("Idle");
   const [connected, setConnected] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
@@ -183,11 +273,6 @@ export default function App() {
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
-    const storedPassword = sessionStorage.getItem(PASSWORD_KEY);
-    if (storedPassword) {
-      setPassword(storedPassword);
-      setPasswordInput(storedPassword);
-    }
     if (stored) {
       try {
         const parsed = JSON.parse(stored) as { state: ClipState; history?: HistoryEntry[] };
@@ -233,50 +318,72 @@ export default function App() {
     if (!password) {
       return;
     }
-    const wsUrl = apiBase
-      ? makeWsUrl(apiBase, secret, password)
-      : makeWsUrl(window.location.origin, secret, password);
-    const socket = new WebSocket(wsUrl);
-    socketRef.current = socket;
 
-    socket.addEventListener("open", () => {
-      setConnected(true);
-      setStatus("Live");
-    });
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+    let attempt = 0;
 
-    socket.addEventListener("close", () => {
-      setConnected(false);
-      setStatus("Disconnected");
-    });
+    const handleSocketPayload = (payload: ClipState, historyFromServer?: HistoryEntry[]) => {
+      const normalized = normalizeClipState(payload);
+      setState(normalized);
+      setHistory((prev) => {
+        const next = applyServerPayload(normalized, historyFromServer, prev);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload(normalized, next)));
+        return next;
+      });
+    };
 
-    socket.addEventListener("message", (event) => {
-      try {
-        const msg = JSON.parse(event.data) as SocketMessage;
-        if (msg.type === "state" || msg.type === "update") {
-          const payload = normalizeClipState(msg.payload);
-          setState(payload);
-          setHistory((prev) => {
-            if (!payload.updatedAt) {
-              return prev;
-            }
-            const nextEntry = normalizeHistoryEntry({
-              text: payload.text,
-              image: payload.image,
-              updatedAt: payload.updatedAt
-            });
-            const deduped = prev.filter((entry) => entry.updatedAt !== nextEntry.updatedAt);
-            const next = [nextEntry, ...deduped].slice(0, HISTORY_LIMIT);
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload(payload, next)));
-            return next;
-          });
-        }
-      } catch {
-        // ignore invalid message
+    const connect = () => {
+      if (cancelled) {
+        return;
       }
-    });
+
+      const wsUrl = apiBase
+        ? makeWsUrl(apiBase, secret, password)
+        : makeWsUrl(window.location.origin, secret, password);
+      socket = new WebSocket(wsUrl);
+      socketRef.current = socket;
+
+      socket.addEventListener("open", () => {
+        attempt = 0;
+        setConnected(true);
+        setStatus("Live");
+      });
+
+      socket.addEventListener("close", () => {
+        setConnected(false);
+        socketRef.current = null;
+        if (cancelled) {
+          return;
+        }
+        setStatus("Reconnecting...");
+        const delay = Math.min(1000 * 2 ** attempt, 15000);
+        attempt += 1;
+        reconnectTimer = setTimeout(connect, delay);
+      });
+
+      socket.addEventListener("message", (event) => {
+        try {
+          const msg = JSON.parse(event.data) as SocketMessage;
+          if (msg.type === "state" || msg.type === "update") {
+            handleSocketPayload(msg.payload, msg.history);
+          }
+        } catch {
+          // ignore invalid message
+        }
+      });
+    };
+
+    connect();
 
     return () => {
-      socket.close();
+      cancelled = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+      socket?.close();
+      socketRef.current = null;
     };
   }, [apiBase, secret, password]);
 
@@ -296,8 +403,9 @@ export default function App() {
     try {
       await writeClipToClipboard(state);
       setStatus(state.image ? "Image copied" : "Copied to clipboard");
-    } catch {
-      setStatus("Copy failed");
+    } catch (error) {
+      clipBufferRef.current = { text: state.text, image: state.image };
+      setStatus(error instanceof Error ? error.message : "Copy failed");
     }
   };
 
@@ -402,6 +510,12 @@ export default function App() {
       if (!res.ok) {
         throw new Error("Send failed");
       }
+      const data = (await res.json()) as ClipState & { history?: HistoryEntry[] };
+      const nextState = normalizeClipState(data);
+      const nextHistory = (data.history ?? []).map(normalizeHistoryEntry).slice(0, HISTORY_LIMIT);
+      setState(nextState);
+      setHistory(nextHistory);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload(nextState, nextHistory)));
       setInput("");
       setPendingImage(null);
       setStatus("Sent");
@@ -412,7 +526,7 @@ export default function App() {
 
   const handleShareCopy = async () => {
     try {
-      await navigator.clipboard.writeText(shareUrl);
+      await copyTextToClipboard(shareUrl);
       setStatus("Share link copied");
     } catch {
       setStatus("Share copy failed");
